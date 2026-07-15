@@ -123,10 +123,6 @@ static ngx_ipset_test_result_t ngx_test_ip_is_in_set(
 {
     int ret;
     const struct ipset_type* type;
-    const char* err;
-
-    /* Clear stale diagnostics from any previous use of this session. */
-    ipset_session_report_reset(session);
 
     ret = ipset_parse_setname(session, IPSET_SETNAME, set);
     if (NGX_UNLIKELY(ret < 0)) {
@@ -149,14 +145,6 @@ static ngx_ipset_test_result_t ngx_test_ip_is_in_set(
     }
 
     if (ret < 0) {
-        err = ipset_session_error(session);
-
-        /* Best-effort split: if libipset left a report message, treat it
-         * as a real failure; otherwise treat the negative return as "not in set". */
-        if (err && *err) {
-            return IPS_TEST_FAIL;
-        }
-
         return IPS_TEST_IS_NOT_IN_SET;
     }
 
