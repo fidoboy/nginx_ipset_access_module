@@ -211,24 +211,20 @@ typedef struct ngx_ipset_command_conf_s {
 } ngx_ipset_access_loc_conf_t;
 
 static int ngx_str_copy(ngx_pool_t* pool, ngx_str_t* dst, ngx_str_t const* src) {
-    if (NGX_UNLIKELY(dst->len >= src->len)) {
-        memcpy(dst->data, src->data, src->len);
-        dst->len = src->len;
-        return 0;
-    } else {
-        if (NGX_UNLIKELY(dst->data)) {
-            ngx_pfree(pool, dst->data);
-        }
-        dst->data = ngx_pcalloc(pool, src->len + 1);
-        if (!dst->data) {
-            dst->len = 0;
-            return ENOMEM;
-        }
-        memcpy(dst->data, src->data, src->len);
-        dst->data[src->len] = 0;
-        dst->len = src->len;
-        return 0;
+    if (!dst || !src) {
+        return EINVAL;
     }
+
+    dst->data = ngx_pnalloc(pool, src->len + 1);
+    if (!dst->data) {
+        dst->len = 0;
+        return ENOMEM;
+    }
+
+    ngx_memcpy(dst->data, src->data, src->len);
+    dst->data[src->len] = '\0';
+    dst->len = src->len;
+    return 0;
 }
 
 static int ngx_str_array_copy(ngx_pool_t* pool, ngx_array_t* dst, ngx_array_t const* src, ngx_uint_t si) {
@@ -340,7 +336,8 @@ static char* ngx_ipset_access_loc_conf_merge(ngx_conf_t* cf, void* parent, void*
     return NGX_OK;
 }
 
-static char* ngx_ipset_access_loc_conf_parse(ngx_conf_t* cf, ngx_command_t* command, void* pv_conf) {
+static char* ngx_ipset_access_loc_conf_parse(ngx_conf_t *cf, ngx_command_t *command, void *pv_conf) {
+    (void) command;
     ngx_uint_t i;
     ngx_str_t* value;
     ngx_ipset_session_t* session;
@@ -625,7 +622,7 @@ static ngx_int_t ngx_ipset_access_http_access_handler(ngx_http_request_t* reques
                     ngx_log_debug3(NGX_LOG_DEBUG, c->log, 0, "test %V %V -> %d", set, &ip, result);
 #endif
                     if (result == IPS_TEST_FAIL) {
-                        ngx_log_error(NGX_LOG_WARN, c->log, 0, "Failed to test presence of IP in IPSET.");
+                        ngx_log_error(NGX_LOG_WARN, c->log, 0, "ipset_access: failed to test client %V against set %V", &ip, set);
                     }
                     break;
                 }
