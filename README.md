@@ -25,10 +25,7 @@ an nginx module that controls access using Netfilter `ipset` sets
   (`ngx_http_get_module_loc_conf`,
   `ngx_http_conf_get_module_main_conf`, etc.), whose ABI/API has
   remained compatible between the nginx version the module was
-  originally written for and nginx 1.31.x. Compatibility of
-  `connection->addr_text`, HTTP phases, and the
-  `ngx_command_t`/`ngx_http_module_t` structures has been specifically
-  verified.
+  originally written for and nginx 1.31.x.
 
 ## Migration notes
 
