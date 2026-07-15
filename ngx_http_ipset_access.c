@@ -3,6 +3,11 @@
  * Author: Mohammad Mahdi Roozitalab <mehdiboss_qi@hotmail.com>
  ********************************************************************/
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#include <netinet/in.h>
 #include <pthread.h>
 #include <sys/socket.h>
 
@@ -466,6 +471,7 @@ static ngx_int_t ngx_ipset_access_http_access_handler(ngx_http_request_t* reques
         size_t ip_len;
         ngx_ipset_session_t* session;
         ngx_ipset_test_result_t result = 0;
+        ngx_str_t *matched_set = NULL;
 
         /* ngx_sock_ntop() handles both AF_INET and AF_INET6 addresses,
          * unlike inet_ntoa() which only understands IPv4. */
@@ -478,14 +484,14 @@ static ngx_int_t ngx_ipset_access_http_access_handler(ngx_http_request_t* reques
         ngx_log_debug1(NGX_LOG_INFO, request->connection->log, 0, "testing '%s' in IPSET for permission", ip);
         #endif
         session = ngx_get_session();
+
         if (!session) {
             ngx_log_error(NGX_LOG_WARN, request->connection->log, 0, "failed to load an IPSET session");
             result = IPS_TEST_FAIL;
         } else {
             ngx_uint_t i;
             ngx_str_t* set = conf->sets.elts;
-            ngx_str_t *matched_set = NULL;
-
+            
             /* Default when no set produces a definitive match: "not found".
              * We must not let `result` end up holding whatever the LAST
              * tested set happened to return, or the final decision would
@@ -524,7 +530,7 @@ static ngx_int_t ngx_ipset_access_http_access_handler(ngx_http_request_t* reques
          * blacklist: block only IPs found in one of the configured sets. */
         if ((conf->mode == e_mode_whitelist && (result != IPS_TEST_IS_IN_SET)) ||
             (conf->mode == e_mode_blacklist && (result == IPS_TEST_IS_IN_SET))) {
-            
+
             request->keepalive = 0;
             if (matched_set) {
                 ngx_log_error(NGX_LOG_NOTICE, request->connection->log, 0,  "Blocking client %s due to IPSET \"%V\"", ip, matched_set);
@@ -536,7 +542,7 @@ static ngx_int_t ngx_ipset_access_http_access_handler(ngx_http_request_t* reques
             return NGX_HTTP_CLOSE;
         }
 
-        return NGX_OK;  
+        return NGX_OK;
     }
 
     return NGX_DECLINED;
