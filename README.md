@@ -12,33 +12,12 @@ an nginx module that controls access using Netfilter `ipset` sets
   `family inet6` and reference it from `blacklist`/`whitelist` just like
   an IPv4 set (IPv4 and IPv6 sets can be mixed within the same
   directive).
-- **`addr_text` instead of `inet_ntoa`.** `inet_ntoa()` only supports
-  `struct sockaddr_in`, making it the root cause of the lack of IPv6
-  support. The module now uses `connection->addr_text`, which nginx
-  populates for any address family. Since `libipset` expects a
-  null-terminated C string while `addr_text` is an `ngx_str_t` (not
-  necessarily null-terminated), the address is copied into a local
-  buffer of size `NGX_INET6_ADDRSTRLEN`. Additionally, IPv4-mapped IPv6
-  addresses (`::ffff:a.b.c.d`, commonly seen with dual-stack sockets)
-  are normalized to plain IPv4 notation so they continue matching IPv4
-  `ipset`s.
 - **HTTP 444 instead of 403.** Previously, blocked requests returned
   `403 Forbidden` (despite the source code containing an unused
   `//return 444;` comment). The module now always returns
   `NGX_HTTP_CLOSE` (444), causing nginx to close the connection without
   sending any response instead of explicitly informing the client that
   access was denied.
-- **`location` context support.** The `blacklist` and `whitelist`
-  directives were originally valid only in `http {}` and `server {}`
-  (`NGX_HTTP_SRV_CONF`). They are now also accepted inside
-  `location {}` blocks (`NGX_HTTP_LOC_CONF`) with the same inheritance
-  model already used elsewhere: if a `location` does not define its own
-  configuration, it inherits its parent `server`/`http` settings; if it
-  does, it overrides them (including `blacklist off;` /
-  `whitelist off;` to disable filtering for a specific location). This
-  follows the same pattern used by nginx's built-in
-  `ngx_http_access_module` (`allow`/`deny`) through
-  `create_loc_conf`/`merge_loc_conf`.
 - **Verified compatibility with the nginx 1.31.x API.** The module
   continues to use the same HTTP phase mechanism
   (`NGX_HTTP_PREACCESS_PHASE`), the same HTTP module context, and the
