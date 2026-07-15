@@ -41,6 +41,7 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
+#include <stdbool.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 
@@ -118,9 +119,14 @@ static void ngx_destroy_ipset_session(void* session) {
 static ngx_ipset_test_result_t ngx_test_ip_is_in_set(
     ngx_ipset_session_t* session,
     char const* set,
-    char const* ip) {
+    char const* ip)
+{
     int ret;
     const struct ipset_type* type;
+    const char* err;
+
+    /* Clear stale diagnostics from any previous use of this session. */
+    ipset_session_report_reset(session);
 
     ret = ipset_parse_setname(session, IPSET_SETNAME, set);
     if (NGX_UNLIKELY(ret < 0)) {
@@ -132,20 +138,29 @@ static ngx_ipset_test_result_t ngx_test_ip_is_in_set(
         return IPS_TEST_FAIL;
     }
 
-    /* ipset_parse_elem auto-detects the address family (IPv4 vs IPv6)
-     * from the textual representation of "ip", so the very same code
-     * path works transparently for both hash:ip/hash:net sets created
-     * with "family inet" and with "family inet6". */
     ret = ipset_parse_elem(session, type->last_elem_optional, ip);
     if (NGX_UNLIKELY(ret < 0)) {
         return IPS_TEST_INVALID_IP;
     }
 
     ret = ipset_cmd(session, IPSET_CMD_TEST, 0);
+    if (ret == 0) {
+        return IPS_TEST_IS_IN_SET;
+    }
+
     if (ret < 0) {
+        err = ipset_session_error(session);
+
+        /* Best-effort split: if libipset left a report message, treat it
+         * as a real failure; otherwise treat the negative return as "not in set". */
+        if (err && *err) {
+            return IPS_TEST_FAIL;
+        }
+
         return IPS_TEST_IS_NOT_IN_SET;
     }
-    return IPS_TEST_IS_IN_SET;
+
+    return IPS_TEST_FAIL;
 }
 
 /********************************************************************/
@@ -378,6 +393,17 @@ static char* ngx_ipset_access_loc_conf_parse(ngx_conf_t* cf, ngx_command_t* comm
     // typo in the set name, or an inet6 set with an inet-only pattern)
     // are caught at configuration time instead of at request time.
     //
+    // Both an IPv4 and an IPv6 probe address are tried per set: a set
+    // created with "family inet6" will reject an IPv4 probe address in
+    // ipset_parse_elem() -- before the kernel is ever actually queried
+    // -- so testing with only one family risks the real set-name
+    // validation being masked by a family mismatch instead. The set is
+    // only considered valid if at least one of the two probes reaches
+    // the kernel with a real answer (in-set or not-in-set); if both
+    // come back as an error, this module expects hash:ip/hash:net
+    // sets, so that is a genuine configuration mistake and must fail
+    // "nginx -t", not just warn.
+    //
     // This runs in the master process while parsing the config, before
     // any worker exists, so it cannot use the per-worker session above;
     // it creates and destroys a throwaway session of its own instead.
@@ -399,20 +425,29 @@ static char* ngx_ipset_access_loc_conf_parse(ngx_conf_t* cf, ngx_command_t* comm
 
     value = conf->sets.elts;
     for (i = 0; i < conf->sets.nelts; i++, value++) {
-        ngx_ipset_test_result_t result = ngx_test_ip_is_in_set(session, (const char*)value->data, "127.0.0.1");
-        if (result == IPS_TEST_FAIL || result == IPS_TEST_INVALID_SETNAME) {
-            // error in testing IP in set
-#ifdef NGX_DEBUG
-            ngx_log_debug1(NGX_LOG_INFO, cf->log, EINVAL, "error in testing IP in set(%s)", value->data);
-#endif
+        ngx_ipset_test_result_t result_v4;
+        ngx_ipset_test_result_t result_v6;
+
+        result_v4 = ngx_test_ip_is_in_set(session, (const char*)value->data, "127.0.0.1");
+        result_v6 = ngx_test_ip_is_in_set(session, (const char*)value->data, "::1");
+
+        if (result_v4 != IPS_TEST_IS_IN_SET && result_v4 != IPS_TEST_IS_NOT_IN_SET &&
+            result_v6 != IPS_TEST_IS_IN_SET && result_v6 != IPS_TEST_IS_NOT_IN_SET) {
+            // Neither probe reached a real answer from the kernel: the
+            // set name is wrong, or it is not a family inet/inet6
+            // hash:ip/hash:net set as this module expects.
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "ipset_access: set \"%V\" failed validation for both IPv4 and IPv6 "
+                "(v4 result: %d, v6 result: %d); check the set name and its family",
+                value, result_v4, result_v6);
             ngx_destroy_ipset_session(session);
             return (char*)NGX_ERROR;
-        } else {
-#ifdef NGX_DEBUG
-            ngx_log_debug4(NGX_LOG_INFO, cf->log, 0, "ngx_test_ip_is_in_set(%p, %s, %s) -> %d",
-                session, (const char*)value->data, "127.0.0.1", result);
-#endif
         }
+
+#ifdef NGX_DEBUG
+        ngx_log_debug3(NGX_LOG_INFO, cf->log, 0, "ngx_test_ip_is_in_set(%V) -> v4:%d v6:%d",
+            value, result_v4, result_v6);
+#endif
     }
 
     ngx_destroy_ipset_session(session);
@@ -552,38 +587,45 @@ static ngx_int_t ngx_ipset_access_get_client_ip(
 }
 
 static ngx_int_t ngx_ipset_access_http_access_handler(ngx_http_request_t* request) {
-    ngx_ipset_access_loc_conf_t *conf = ngx_http_get_module_loc_conf(request, ngx_http_ipset_access);
+    ngx_connection_t *c = request->connection;
+
+    if (c == NULL || c->sockaddr == NULL) {
+        return NGX_DECLINED;
+    }
+
+    ngx_ipset_access_loc_conf_t *conf =
+        ngx_http_get_module_loc_conf(request, ngx_http_ipset_access);
 
 #ifdef NGX_DEBUG
     char temp[129];
-    ngx_log_debug5(NGX_LOG_NOTICE, request->connection->log, 0,
+    ngx_log_debug5(NGX_LOG_NOTICE, c->log, 0,
         "Access handler(mode: %d, sets: %s): {connection: %p, sockaddr: %p, family: %d}",
         conf->mode, ngx_str_array_to_str(temp, sizeof(temp), &conf->sets),
-        request->connection, request->connection ? request->connection->sockaddr : NULL,
-        (request->connection && request->connection->sockaddr) ? request->connection->sockaddr->sa_family : -1);
+        c, c ? c->sockaddr : NULL,
+        (c && c->sockaddr) ? c->sockaddr->sa_family : -1);
 #endif
 
     if ((conf->mode == e_mode_whitelist || conf->mode == e_mode_blacklist) &&
-        (request->connection->sockaddr->sa_family == AF_INET ||
-         request->connection->sockaddr->sa_family == AF_INET6)) {
+        (c->sockaddr->sa_family == AF_INET ||
+         c->sockaddr->sa_family == AF_INET6)) {
         u_char ip_buf[NGX_INET6_ADDRSTRLEN + 1];
         ngx_str_t ip;
         ngx_ipset_session_t* session;
         ngx_ipset_test_result_t result = 0;
 
         if (NGX_UNLIKELY(ngx_ipset_access_get_client_ip(request, ip_buf, sizeof(ip_buf), &ip) != NGX_OK)) {
-            ngx_log_error(NGX_LOG_WARN, request->connection->log, 0,
+            ngx_log_error(NGX_LOG_WARN, c->log, 0,
                 "ipset_access: failed to obtain a textual client address");
             return NGX_DECLINED;
         }
 
 #ifdef NGX_DEBUG
-        ngx_log_debug1(NGX_LOG_INFO, request->connection->log, 0, "testing '%V' in IPSET for permission", &ip);
+        ngx_log_debug1(NGX_LOG_INFO, c->log, 0, "testing '%V' in IPSET for permission", &ip);
 #endif
 
         session = ngx_worker_ipset_session;
         if (!session) {
-            ngx_log_error(NGX_LOG_WARN, request->connection->log, 0, "no IPSET session available for this worker");
+            ngx_log_error(NGX_LOG_WARN, c->log, 0, "no IPSET session available for this worker");
             result = IPS_TEST_FAIL;
         } else {
             ngx_uint_t i;
@@ -592,10 +634,10 @@ static ngx_int_t ngx_ipset_access_http_access_handler(ngx_http_request_t* reques
                 result = ngx_test_ip_is_in_set(session, (const char*)set->data, (const char*)ip.data);
                 if (result != IPS_TEST_IS_NOT_IN_SET) {
 #ifdef NGX_DEBUG
-                    ngx_log_debug3(NGX_LOG_DEBUG, request->connection->log, 0, "test %s %V -> %d", set->data, &ip, result);
+                    ngx_log_debug3(NGX_LOG_DEBUG, c->log, 0, "test %V %V -> %d", set, &ip, result);
 #endif
                     if (result == IPS_TEST_FAIL) {
-                        ngx_log_error(NGX_LOG_WARN, request->connection->log, 0, "Failed to test presence of IP in IPSET.");
+                        ngx_log_error(NGX_LOG_WARN, c->log, 0, "Failed to test presence of IP in IPSET.");
                     }
                     break;
                 }
@@ -607,7 +649,7 @@ static ngx_int_t ngx_ipset_access_http_access_handler(ngx_http_request_t* reques
             /* Denying an IP is expected, routine behavior driven entirely
              * by configuration/ipset contents -- not an emergency
              * condition -- so log it at NOTICE rather than EMERG. */
-            ngx_log_error(NGX_LOG_NOTICE, request->connection->log, 0, "Blocking %V due to IPSET", &ip);
+            ngx_log_error(NGX_LOG_NOTICE, c->log, 0, "Blocking %V due to IPSET", &ip);
 
             /* Close the connection without sending a response, instead of
              * the previous HTTP 403, so that scanners/attackers get no
