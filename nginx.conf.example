@@ -26,18 +26,5 @@ http {
         location / {
             root   /usr/share/nginx/html;
         }
-
-        # Directives are also valid inside "location" blocks now, and
-        # they override whatever was inherited from server{}/http{}.
-        location /admin/ {
-            whitelist office_ips4 office_ips6;
-            root   /usr/share/nginx/html;
-        }
-
-        # A location that should not be filtered at all.
-        location /health {
-            blacklist off;
-            return 200 "ok";
-        }
     }
 }
