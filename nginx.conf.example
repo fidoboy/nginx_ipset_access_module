@@ -1,7 +1,43 @@
-http {
-  # first part is the mode (blacklist or whitelist) and rest of them are command arguments
-  # if command argument is "off" then module is disabled and otherwise it is a list of ipsets that should used in
-  # blacklisting or whitelisting.
-  blacklist ipset_name ;
+user  nginx;
+worker_processes  auto;
 
+# Dynamic module load (if compiled with --add-dynamic-module):
+# load_module modules/ngx_http_ipset_access.so;
+
+events {
+    worker_connections  1024;
+}
+
+http {
+    include       mime.types;
+    default_type  application/octet-stream;
+
+    # A blacklist configured at http{} level applies to every server,
+    # unless overridden below. Add both an IPv4 and an IPv6 ipset:
+    #   sudo ipset create blacklist4 hash:ip family inet
+    #   sudo ipset create blacklist6 hash:ip family inet6
+    blacklist blacklist4 blacklist6;
+
+    server {
+        listen       80;
+        listen       [::]:80;
+        server_name  example.com;
+
+        location / {
+            root   /usr/share/nginx/html;
+        }
+
+        # Directives are also valid inside "location" blocks now, and
+        # they override whatever was inherited from server{}/http{}.
+        location /admin/ {
+            whitelist office_ips4 office_ips6;
+            root   /usr/share/nginx/html;
+        }
+
+        # A location that should not be filtered at all.
+        location /health {
+            blacklist off;
+            return 200 "ok";
+        }
+    }
 }
