@@ -574,10 +574,6 @@ static ngx_int_t ngx_ipset_access_get_client_ip(
 static ngx_int_t ngx_ipset_access_http_access_handler(ngx_http_request_t* request) {
     ngx_connection_t *c = request->connection;
 
-    ngx_log_error(NGX_LOG_NOTICE, c->log, 0,
-        "ipset_access handler reached, addr_text=%V",
-        &c->addr_text);
-
     if (c == NULL || c->sockaddr == NULL) {
         return NGX_DECLINED;
     }
