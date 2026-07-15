@@ -484,6 +484,7 @@ static ngx_int_t ngx_ipset_access_http_access_handler(ngx_http_request_t* reques
         } else {
             ngx_uint_t i;
             ngx_str_t* set = conf->sets.elts;
+            ngx_str_t *matched_set = NULL;
 
             /* Default when no set produces a definitive match: "not found".
              * We must not let `result` end up holding whatever the LAST
@@ -501,6 +502,7 @@ static ngx_int_t ngx_ipset_access_http_access_handler(ngx_http_request_t* reques
                 #endif
 
                 if (r == IPS_TEST_IS_IN_SET) {
+                    matched_set = set;
                     result = r;
                     break;
                 }
@@ -524,11 +526,14 @@ static ngx_int_t ngx_ipset_access_http_access_handler(ngx_http_request_t* reques
             (conf->mode == e_mode_blacklist && (result == IPS_TEST_IS_IN_SET))) {
             
             request->keepalive = 0;
-            ngx_log_error(NGX_LOG_EMERG, request->connection->log, 0, "Blocking %s with due to IPSET", ip);
+            if (matched_set) {
+                ngx_log_error(NGX_LOG_NOTICE, request->connection->log, 0,  "Blocking client %s due to IPSET \"%V\"", ip, matched_set);
+            } else {
+                ngx_log_error(NGX_LOG_NOTICE, request->connection->log, 0,  "Blocking client %s (not present in any whitelist IPSET)", ip);
+            }
 
-            /* Close the connection without sending a response, instead of
-             * returning a standard 403 Forbidden. */
-            return 444;
+            /* Close the connection without sending a response. */
+            return NGX_HTTP_CLOSE;
         }
 
         return NGX_OK;  
