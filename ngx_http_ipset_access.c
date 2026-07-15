@@ -4,19 +4,30 @@
  * Original author: Mohammad Mahdi Roozitalab <mehdiboss_qi@hotmail.com>
  *
  * Fork changes:
- *   - IPv4 + IPv6 client address support (dual stack).
- *   - Client address is now obtained from c->addr_text instead of
- *     inet_ntoa(), which only ever worked for AF_INET.
- *   - Blocked requests now get HTTP 444 (connection closed, no
- *     response sent) instead of HTTP 403.
- *   - The "blacklist"/"whitelist" directives are now also valid
- *     inside "location" blocks (NGX_HTTP_LOC_CONF), in addition to
- *     "http" and "server".
- *   - Verified against the nginx 1.31.x module API (phases, module
- *     context, ngx_http_get_module_loc_conf, connection->addr_text)
- *     -- no changes were required in the core API used by this
- *     module between the version this was originally written
- *     against and 1.31.
+ * - IPv4 + IPv6 client address support (dual stack).
+ * - Client address is now obtained from c->addr_text instead of
+ *   inet_ntoa(), which only ever worked for AF_INET.
+ * - Blocked requests now get HTTP 444 (connection closed, no
+ *   response sent) instead of HTTP 403.
+ * - The "blacklist"/"whitelist" directives are now also valid
+ *   inside "location" blocks (NGX_HTTP_LOC_CONF), in addition to
+ *   "http" and "server".
+ * - Verified against the nginx 1.31.x module API (phases, module
+ *   context, ngx_http_get_module_loc_conf, connection->addr_text)
+ *   -- no changes were required in the core API used by this
+ *   module between the version this was originally written
+ *   against and 1.31.
+ * - Blocking is now logged at NGX_LOG_NOTICE instead of
+ *   NGX_LOG_EMERG: an IP being denied by design is expected,
+ *   routine behavior, not an emergency condition.
+ * - Removed the per-worker libipset session cache built on
+ *   pthread_key_t / pthread_once / TLS. nginx workers are separate
+ *   processes, not threads, so there was never more than one
+ *   session to cache per worker in the first place. The module now
+ *   simply creates a single libipset session in the worker's
+ *   init_process callback and keeps a plain static pointer to it,
+ *   which is simpler and removes an unnecessary dependency on
+ *   pthreads.
  ********************************************************************/
 
 /* ngx_config.h must be included first: it sets the feature-test macros
@@ -30,22 +41,31 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
-#include <pthread.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
 
 #include <libipset/session.h>
 #include <libipset/types.h>
 
+/* Not every platform/nginx build defines NGX_INET6_ADDRSTRLEN (it only
+ * exists when nginx was itself compiled with IPv6 support). Fall back
+ * to the standard INET6_ADDRSTRLEN from <netinet/in.h> in that case. */
+#ifndef NGX_INET6_ADDRSTRLEN
+# define NGX_INET6_ADDRSTRLEN INET6_ADDRSTRLEN
+#endif
+
 #if __GNUC__
-#   define NGX_LIKELY(x)       __builtin_expect(!!(x), 1)
-#   define NGX_UNLIKELY(x)     __builtin_expect(!!(x), 0)
+# define NGX_LIKELY(x)   __builtin_expect(!!(x), 1)
+# define NGX_UNLIKELY(x) __builtin_expect(!!(x), 0)
 #else
-#   define NGX_LIKELY(x)        (x)
-#   define NGX_UNLIKELY(x)      (x)
+# define NGX_LIKELY(x)   (x)
+# define NGX_UNLIKELY(x) (x)
 #endif
 
 /** IPSET integration ***********************************************/
-typedef struct ipset_session        ngx_ipset_session_t;
+
+typedef struct ipset_session ngx_ipset_session_t;
+
 typedef enum ngx_ipset_test_result_t {
     IPS_TEST_IS_IN_SET,
     IPS_TEST_IS_NOT_IN_SET,
@@ -55,18 +75,33 @@ typedef enum ngx_ipset_test_result_t {
 } ngx_ipset_test_result_t;
 
 /** Initialize IPSET.
+ *
+ * ngx_initialize_ipset() is called once per "blacklist"/"whitelist"
+ * directive while parsing the configuration (in the master process),
+ * again on every "nginx -s reload", and once more per worker from
+ * init_process. Since workers are fork()ed from the master, whatever
+ * global state ipset_load_types() registers during config parsing is
+ * already present in each worker's memory via copy-on-write, so this
+ * guard also makes the init_process call a cheap no-op in the common
+ * case rather than a redundant re-registration.
+ *
  * \return 0 to indicate success and other value to indicate error */
+static ngx_uint_t ngx_ipset_types_loaded = 0;
+
 static int ngx_initialize_ipset() {
-    ipset_load_types();
+    if (!ngx_ipset_types_loaded) {
+        ipset_load_types();
+        ngx_ipset_types_loaded = 1;
+    }
     return 0;
 }
 
 /** Create a new IPSET session. */
 static ngx_ipset_session_t* ngx_create_ipset_session() {
 #ifdef WITH_LIBIPSET_V6_COMPAT
-#   define ngx_ipset_session_new() ipset_session_init(printf)
+# define ngx_ipset_session_new() ipset_session_init(printf)
 #else
-#   define ngx_ipset_session_new() ipset_session_init(NULL, NULL)
+# define ngx_ipset_session_new() ipset_session_init(NULL, NULL)
 #endif
     return ngx_ipset_session_new();
 #undef ngx_ipset_session_new
@@ -110,56 +145,46 @@ static ngx_ipset_test_result_t ngx_test_ip_is_in_set(
     if (ret < 0) {
         return IPS_TEST_IS_NOT_IN_SET;
     }
-
     return IPS_TEST_IS_IN_SET;
 }
 
 /********************************************************************/
 
-/** IPSET session caching *******************************************
- * In order to minimize overhead of the application we will cache IPSET
- * sessions in per thread storage.
+/** Per-worker IPSET session *****************************************
+ * nginx workers are independent processes (not threads), so there is
+ * exactly one libipset session to keep per worker. It is created once
+ * in the worker's init_process callback and stored here; every
+ * request handled by this worker reuses the same pointer. No
+ * pthread_key_t / pthread_once / TLS machinery is needed for this.
  ********************************************************************/
-static pthread_key_t ngx_ipset_cache_key;
-static int ngx_ipset_cache_initialize_result = 0;
-static pthread_once_t ngx_ipset_cache_initialize_once = PTHREAD_ONCE_INIT;
 
-static void ngx_ipset_cache_initializer() {
-    ngx_ipset_cache_initialize_result = ngx_initialize_ipset();
-    if (ngx_ipset_cache_initialize_result) {
-        return;
+static ngx_ipset_session_t* ngx_worker_ipset_session = NULL;
+
+/** Create the libipset session for this worker process.
+ * Called once from init_process.
+ * \return NGX_OK on success, NGX_ERROR otherwise. */
+static ngx_int_t ngx_ipset_access_init_worker_session(ngx_log_t* log) {
+    if (ngx_initialize_ipset()) {
+        ngx_log_error(NGX_LOG_ERR, log, 0, "ipset_access: failed to initialize IPSET types");
+        return NGX_ERROR;
     }
 
-    if (pthread_key_create(&ngx_ipset_cache_key, ngx_destroy_ipset_session)) {
-        ngx_ipset_cache_initialize_result = ngx_errno;
+    ngx_worker_ipset_session = ngx_create_ipset_session();
+    if (!ngx_worker_ipset_session) {
+        ngx_log_error(NGX_LOG_ERR, log, 0, "ipset_access: failed to create IPSET session");
+        return NGX_ERROR;
     }
+
+    return NGX_OK;
 }
 
-static int ngx_initialize_ipset_cache() {
-    pthread_once(&ngx_ipset_cache_initialize_once, &ngx_ipset_cache_initializer);
-    return ngx_ipset_cache_initialize_result;
-}
-
-static ngx_ipset_session_t* ngx_get_session() {
-    ngx_ipset_session_t* session;
-    int ret = ngx_initialize_ipset_cache();
-    if (NGX_UNLIKELY(ret)) {
-        ngx_set_errno(ret);
-        return NULL;
+/** Destroy the worker's libipset session.
+ * Called once from exit_process. */
+static void ngx_ipset_access_exit_worker_session() {
+    if (ngx_worker_ipset_session) {
+        ngx_destroy_ipset_session(ngx_worker_ipset_session);
+        ngx_worker_ipset_session = NULL;
     }
-
-    session = pthread_getspecific(ngx_ipset_cache_key);
-    if (NGX_LIKELY(session)) {
-        return session;
-    }
-
-    session = ngx_create_ipset_session();
-    if (NGX_UNLIKELY(!session)) {
-        return NULL;
-    }
-
-    pthread_setspecific(ngx_ipset_cache_key, session);
-    return session;
 }
 
 /********************************************************************/
@@ -171,6 +196,7 @@ static ngx_ipset_session_t* ngx_get_session() {
  * "whitelist" can appear in http{}, server{} and location{} and be
  * correctly inherited down the configuration tree.
  ********************************************************************/
+
 typedef struct ngx_ipset_command_conf_s {
     enum {
         e_mode_not_configured = 0,
@@ -190,13 +216,11 @@ static int ngx_str_copy(ngx_pool_t* pool, ngx_str_t* dst, ngx_str_t const* src) 
         if (NGX_UNLIKELY(dst->data)) {
             ngx_pfree(pool, dst->data);
         }
-
         dst->data = ngx_pcalloc(pool, src->len + 1);
         if (!dst->data) {
             dst->len = 0;
             return ENOMEM;
         }
-
         memcpy(dst->data, src->data, src->len);
         dst->data[src->len] = 0;
         dst->len = src->len;
@@ -221,7 +245,6 @@ static int ngx_str_array_copy(ngx_pool_t* pool, ngx_array_t* dst, ngx_array_t co
             return ret;
         }
     }
-
     return 0;
 }
 
@@ -243,27 +266,22 @@ static char* ngx_str_array_to_str(char* buffer, size_t len, ngx_array_t const* a
         ngx_uint_t i;
         bool more = false;
         ngx_str_t* value = array->elts;
-
         for (i = 0; i < array->nelts; i++) {
             size_t cp = value->len;
             if (i) {
                 *b++ = ',';
             }
-
             if (cp > (size_t)(e - b)) {
                 cp = e - b;
                 more = true;
             }
-
             memcpy(b, value->data, cp);
-            b += value->len;
-
+            b += cp;
             if (more) {
                 break;
             }
             ++value;
         }
-
         if (more) {
             memcpy(e - 3, "...]", 5);
         } else {
@@ -271,7 +289,6 @@ static char* ngx_str_array_to_str(char* buffer, size_t len, ngx_array_t const* a
             *b++ = 0;
         }
     }
-
     return buffer;
 }
 #endif
@@ -360,8 +377,18 @@ static char* ngx_ipset_access_loc_conf_parse(ngx_conf_t* cf, ngx_command_t* comm
     // test input sets, both for IPv4 and IPv6, so that mistakes (e.g. a
     // typo in the set name, or an inet6 set with an inet-only pattern)
     // are caught at configuration time instead of at request time.
-    value = conf->sets.elts;
-    session = ngx_get_session();
+    //
+    // This runs in the master process while parsing the config, before
+    // any worker exists, so it cannot use the per-worker session above;
+    // it creates and destroys a throwaway session of its own instead.
+    if (ngx_initialize_ipset()) {
+#ifdef NGX_DEBUG
+        ngx_log_debug0(NGX_LOG_INFO, cf->log, EINVAL, "Failed to initialize IPSET types");
+#endif
+        return (char*)NGX_ERROR;
+    }
+
+    session = ngx_create_ipset_session();
     if (!session) {
         // failed to create session
 #ifdef NGX_DEBUG
@@ -370,6 +397,7 @@ static char* ngx_ipset_access_loc_conf_parse(ngx_conf_t* cf, ngx_command_t* comm
         return (char*)NGX_ERROR;
     }
 
+    value = conf->sets.elts;
     for (i = 0; i < conf->sets.nelts; i++, value++) {
         ngx_ipset_test_result_t result = ngx_test_ip_is_in_set(session, (const char*)value->data, "127.0.0.1");
         if (result == IPS_TEST_FAIL || result == IPS_TEST_INVALID_SETNAME) {
@@ -377,6 +405,7 @@ static char* ngx_ipset_access_loc_conf_parse(ngx_conf_t* cf, ngx_command_t* comm
 #ifdef NGX_DEBUG
             ngx_log_debug1(NGX_LOG_INFO, cf->log, EINVAL, "error in testing IP in set(%s)", value->data);
 #endif
+            ngx_destroy_ipset_session(session);
             return (char*)NGX_ERROR;
         } else {
 #ifdef NGX_DEBUG
@@ -386,6 +415,7 @@ static char* ngx_ipset_access_loc_conf_parse(ngx_conf_t* cf, ngx_command_t* comm
         }
     }
 
+    ngx_destroy_ipset_session(session);
     return NGX_OK;
 }
 
@@ -397,6 +427,7 @@ static ngx_int_t ngx_ipset_access_http_access_handler(ngx_http_request_t* reques
 /********************************************************************/
 
 /** NGINX HTTP module ***********************************************/
+
 #define IPSET_ACCESS_COMMAND(name) { \
     /* name */   ngx_string(name), \
     /*** configurable in main config, virtual server and location ***/ \
@@ -425,9 +456,7 @@ static ngx_int_t ngx_ipset_access_install_handlers(ngx_conf_t *cf) {
 #endif
 
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
-
     checked_array_push(cmcf->phases[NGX_HTTP_PREACCESS_PHASE].handlers, ngx_ipset_access_http_access_handler);
-
     return NGX_OK;
 }
 
@@ -435,22 +464,34 @@ static ngx_int_t ngx_ipset_access_on_init_process(ngx_cycle_t *cycle) {
 #ifdef NGX_DEBUG
     ngx_log_debug0(NGX_LOG_NOTICE, cycle->log, 0, "module init_process called");
 #endif
+
+    if (ngx_ipset_access_init_worker_session(cycle->log) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
     return NGX_OK;
 }
 
+static void ngx_ipset_access_on_exit_process(ngx_cycle_t *cycle) {
+#ifdef NGX_DEBUG
+    ngx_log_debug0(NGX_LOG_NOTICE, cycle->log, 0, "module exit_process called");
+#endif
+
+    ngx_ipset_access_exit_worker_session();
+}
+
 static ngx_http_module_t ngx_http_ipset_access_module_context = {
-    NULL,                                  /* preconfiguration */
+    NULL,                               /* preconfiguration */
+    ngx_ipset_access_install_handlers,  /* postconfiguration */
 
-    ngx_ipset_access_install_handlers,     /* postconfiguration */
+    NULL,                               /* create main configuration */
+    NULL,                               /* merge main configuration */
 
-    NULL,                                  /* create main configuration */
-    NULL,                                  /* merge main configuration */
+    NULL,                               /* create server configuration */
+    NULL,                               /* merge server configuration */
 
-    NULL,                                  /* create server configuration */
-    NULL,                                  /* merge server configuration */
-
-    ngx_ipset_access_loc_conf_create,      /* create location configuration */
-    ngx_ipset_access_loc_conf_merge        /* merge location configuration */
+    ngx_ipset_access_loc_conf_create,   /* create location configuration */
+    ngx_ipset_access_loc_conf_merge     /* merge location configuration */
 };
 
 ngx_module_t ngx_http_ipset_access = {
@@ -463,7 +504,7 @@ ngx_module_t ngx_http_ipset_access = {
     ngx_ipset_access_on_init_process,      /* init process */
     NULL,                                  /* init thread */
     NULL,                                  /* exit thread */
-    NULL,                                  /* exit process */
+    ngx_ipset_access_on_exit_process,      /* exit process */
     NULL,                                  /* exit master */
     NGX_MODULE_V1_PADDING
 };
@@ -505,10 +546,8 @@ static ngx_int_t ngx_ipset_access_get_client_ip(
 
     ngx_memcpy(buf, data, len);
     buf[len] = '\0';
-
     out->data = buf;
     out->len = len;
-
     return NGX_OK;
 }
 
@@ -542,15 +581,15 @@ static ngx_int_t ngx_ipset_access_http_access_handler(ngx_http_request_t* reques
         ngx_log_debug1(NGX_LOG_INFO, request->connection->log, 0, "testing '%V' in IPSET for permission", &ip);
 #endif
 
-        session = ngx_get_session();
+        session = ngx_worker_ipset_session;
         if (!session) {
-            ngx_log_error(NGX_LOG_WARN, request->connection->log, 0, "failed to load an IPSET session");
+            ngx_log_error(NGX_LOG_WARN, request->connection->log, 0, "no IPSET session available for this worker");
             result = IPS_TEST_FAIL;
         } else {
             ngx_uint_t i;
             ngx_str_t* set = conf->sets.elts;
             for (i = 0; i < conf->sets.nelts; i++, set++) {
-                result = ngx_test_ip_is_in_set(session, (char*)set->data, (char*)ip.data);
+                result = ngx_test_ip_is_in_set(session, (const char*)set->data, (const char*)ip.data);
                 if (result != IPS_TEST_IS_NOT_IN_SET) {
 #ifdef NGX_DEBUG
                     ngx_log_debug3(NGX_LOG_DEBUG, request->connection->log, 0, "test %s %V -> %d", set->data, &ip, result);
@@ -565,12 +604,16 @@ static ngx_int_t ngx_ipset_access_http_access_handler(ngx_http_request_t* reques
 
         if ((conf->mode == e_mode_whitelist && (result != IPS_TEST_IS_NOT_IN_SET)) ||
             (conf->mode == e_mode_blacklist && (result == IPS_TEST_IS_IN_SET))) {
-            request->keepalive = 0;
-            ngx_log_error(NGX_LOG_EMERG, request->connection->log, 0, "Blocking %V due to IPSET", &ip);
+            /* Denying an IP is expected, routine behavior driven entirely
+             * by configuration/ipset contents -- not an emergency
+             * condition -- so log it at NOTICE rather than EMERG. */
+            ngx_log_error(NGX_LOG_NOTICE, request->connection->log, 0, "Blocking %V due to IPSET", &ip);
 
             /* Close the connection without sending a response, instead of
              * the previous HTTP 403, so that scanners/attackers get no
-             * information at all about why (or that) they were blocked. */
+             * information at all about why (or that) they were blocked.
+             * NGX_HTTP_CLOSE already tears the connection down, so there
+             * is no need to additionally clear request->keepalive. */
             return NGX_HTTP_CLOSE;
         }
 
